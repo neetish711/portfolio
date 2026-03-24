@@ -37,6 +37,7 @@ class NaukriAutomation {
     logger.info("Launching browser...");
     this.browser = await puppeteer.launch({
       headless: config.browser.headless ? "new" : false,
+      userDataDir: config.browser.userDataDir,
       args: config.browser.args,
       defaultViewport: config.browser.defaultViewport,
     });
@@ -52,16 +53,15 @@ class NaukriAutomation {
   }
 
   async login() {
-    logger.info("Navigating to Naukri login page...");
-    await this.page.goto(config.naukri.loginUrl, {
-      waitUntil: "networkidle2",
-      timeout: 30000,
-    });
+    if (config.naukri.loginMethod === "gmail-sso") {
+      await this.loginWithGmailSSO();
+    } else {
+      await this.loginWithEmailPassword();
+    }
+  }
 
-    await sleep(config.delays.pageLoadWait);
-
-    // Check for captcha
-    const captchaPresent = await this.page.evaluate(() => {
+  async checkForCaptcha(page) {
+    const captchaPresent = await page.evaluate(() => {
       const body = document.body.innerText.toLowerCase();
       return (
         body.includes("captcha") ||
@@ -70,13 +70,220 @@ class NaukriAutomation {
         !!document.querySelector("iframe[src*='recaptcha']")
       );
     });
-
     if (captchaPresent) {
-      const msg = "CAPTCHA detected on login page — aborting";
+      const msg = "CAPTCHA detected — aborting";
       logger.error(msg);
       this.errors.push(msg);
       throw new Error(msg);
     }
+  }
+
+  async verifyLoginSuccess() {
+    // Check if we're on the Naukri homepage/dashboard (logged-in state)
+    await sleep(config.delays.afterLogin);
+
+    const isLoggedIn = await this.page.evaluate(() => {
+      // Naukri shows user menu / profile icon when logged in
+      return (
+        !!document.querySelector('[class*="nI-gNb-drawer"]') ||
+        !!document.querySelector('[class*="user-name"]') ||
+        !!document.querySelector('.nI-gNb-header__right .nI-gNb-icon') ||
+        !!document.querySelector('[class*="profile"]') ||
+        document.cookie.includes("nauk_at") ||
+        !document.querySelector('a[href*="login"]')
+      );
+    });
+
+    if (!isLoggedIn) {
+      // Also check by navigating to profile
+      const currentUrl = this.page.url();
+      if (
+        currentUrl.includes("naukri.com") &&
+        !currentUrl.includes("login") &&
+        !currentUrl.includes("nlogin")
+      ) {
+        logger.info("Login appears successful (redirected away from login page)");
+        return;
+      }
+
+      const msg = "Login verification failed — could not confirm logged-in state";
+      logger.error(msg);
+      this.errors.push(msg);
+      throw new Error(msg);
+    }
+
+    logger.info("Login verified successfully");
+  }
+
+  async loginWithGmailSSO() {
+    logger.info("Logging in via Gmail SSO...");
+    await this.page.goto(config.naukri.loginUrl, {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
+    await sleep(config.delays.pageLoadWait);
+    await this.checkForCaptcha(this.page);
+
+    // Check if already logged in (persisted session from userDataDir)
+    const alreadyLoggedIn = await this.page.evaluate(() => {
+      return (
+        !!document.querySelector('[class*="nI-gNb-drawer"]') ||
+        !!document.querySelector('[class*="user-name"]')
+      );
+    });
+    const currentUrl = this.page.url();
+    if (
+      alreadyLoggedIn ||
+      (currentUrl.includes("naukri.com") &&
+        !currentUrl.includes("login") &&
+        !currentUrl.includes("nlogin"))
+    ) {
+      logger.info("Already logged in from previous session (persisted profile)");
+      return;
+    }
+
+    // Set up popup listener BEFORE clicking Google button
+    const googlePopupPromise = new Promise((resolve) => {
+      this.browser.once("targetcreated", async (target) => {
+        const popup = await target.page();
+        resolve(popup);
+      });
+    });
+
+    // Click the "Login with Google" / "Google" button on Naukri
+    logger.info("Clicking Google SSO button...");
+    const googleBtnClicked = await this.page.evaluate(() => {
+      // Naukri uses various selectors for the Google login button
+      const selectors = [
+        'button[class*="google"]',
+        'a[class*="google"]',
+        'div[class*="google"]',
+        'button[class*="Google"]',
+        'a[class*="Google"]',
+        ".google-login-btn",
+        '[data-login-type="google"]',
+        'button[aria-label*="Google"]',
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          el.click();
+          return true;
+        }
+      }
+      // Fallback: find by text content
+      const allBtns = document.querySelectorAll("button, a, div[role='button']");
+      for (const btn of allBtns) {
+        const text = btn.textContent.trim().toLowerCase();
+        if (text.includes("google") && (text.includes("login") || text.includes("sign in") || text.includes("continue"))) {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (!googleBtnClicked) {
+      const msg = "Could not find Google SSO button on Naukri login page";
+      logger.error(msg);
+      this.errors.push(msg);
+      throw new Error(msg);
+    }
+
+    logger.info("Waiting for Google OAuth popup...");
+
+    // Wait for the Google popup to appear (with timeout)
+    const googlePopup = await Promise.race([
+      googlePopupPromise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Google popup did not appear within 15s")), 15000)
+      ),
+    ]);
+
+    if (!googlePopup) {
+      throw new Error("Google OAuth popup failed to open");
+    }
+
+    await sleep(config.delays.pageLoadWait);
+
+    // Enter Google email
+    logger.info("Entering Google email...");
+    const emailInput = await googlePopup.waitForSelector(
+      'input[type="email"], input#identifierId',
+      { timeout: 15000 }
+    );
+    await emailInput.click({ clickCount: 3 });
+    await emailInput.type(config.google.email, { delay: 70 });
+    await randomDelay();
+
+    // Click Next
+    const nextBtn1 = await googlePopup.$("#identifierNext, button:has-text('Next')");
+    if (nextBtn1) {
+      await nextBtn1.click();
+    } else {
+      await googlePopup.evaluate(() => {
+        const btns = document.querySelectorAll("button");
+        for (const b of btns) {
+          if (b.textContent.trim().toLowerCase() === "next") {
+            b.click();
+            break;
+          }
+        }
+      });
+    }
+
+    await sleep(config.delays.pageLoadWait + 2000);
+
+    // Check for CAPTCHA on Google page
+    await this.checkForCaptcha(googlePopup);
+
+    // Enter Google password
+    logger.info("Entering Google password...");
+    const passwordInput = await googlePopup.waitForSelector(
+      'input[type="password"], input[name="Passwd"]',
+      { timeout: 15000 }
+    );
+    await passwordInput.click({ clickCount: 3 });
+    await passwordInput.type(config.google.password, { delay: 70 });
+    await randomDelay();
+
+    // Click Next
+    const nextBtn2 = await googlePopup.$("#passwordNext, button:has-text('Next')");
+    if (nextBtn2) {
+      await nextBtn2.click();
+    } else {
+      await googlePopup.evaluate(() => {
+        const btns = document.querySelectorAll("button");
+        for (const b of btns) {
+          if (b.textContent.trim().toLowerCase() === "next") {
+            b.click();
+            break;
+          }
+        }
+      });
+    }
+
+    logger.info("Google credentials submitted, waiting for redirect...");
+    await sleep(config.delays.afterLogin + 3000);
+
+    // The popup should close and Naukri should now be logged in
+    // Wait for the main page to reflect login
+    await this.page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {
+      // Navigation may have already completed
+    });
+
+    await this.verifyLoginSuccess();
+    logger.info("Gmail SSO login successful");
+  }
+
+  async loginWithEmailPassword() {
+    logger.info("Logging in with email/password...");
+    await this.page.goto(config.naukri.loginUrl, {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
+    await sleep(config.delays.pageLoadWait);
+    await this.checkForCaptcha(this.page);
 
     // Fill credentials
     logger.info("Entering credentials...");
@@ -121,7 +328,7 @@ class NaukriAutomation {
       throw new Error(msg);
     }
 
-    logger.info("Login successful");
+    logger.info("Email/password login successful");
   }
 
   buildSearchUrl(keyword) {

@@ -2,11 +2,19 @@ const path = require("path");
 
 const config = {
   // Naukri credentials — set via environment variables
+  // loginMethod: "gmail-sso" (default) or "email-password"
   naukri: {
+    loginMethod: process.env.NAUKRI_LOGIN_METHOD || "gmail-sso",
     email: process.env.NAUKRI_EMAIL || "",
     password: process.env.NAUKRI_PASSWORD || "",
     loginUrl: "https://www.naukri.com/nlogin/login",
     baseUrl: "https://www.naukri.com",
+  },
+
+  // Google account credentials (used when loginMethod is "gmail-sso")
+  google: {
+    email: process.env.GOOGLE_EMAIL || "",
+    password: process.env.GOOGLE_PASSWORD || "",
   },
 
   // Job search parameters
@@ -35,6 +43,8 @@ const config = {
   // Browser settings
   browser: {
     headless: process.env.HEADLESS !== "false",
+    // Persist browser profile so Google SSO session survives across runs
+    userDataDir: path.join(__dirname, "..", "data", "chrome-profile"),
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -67,8 +77,15 @@ const config = {
 
 function validateConfig() {
   const errors = [];
-  if (!config.naukri.email) errors.push("NAUKRI_EMAIL is not set");
-  if (!config.naukri.password) errors.push("NAUKRI_PASSWORD is not set");
+
+  if (config.naukri.loginMethod === "gmail-sso") {
+    if (!config.google.email) errors.push("GOOGLE_EMAIL is not set");
+    if (!config.google.password) errors.push("GOOGLE_PASSWORD is not set");
+  } else {
+    if (!config.naukri.email) errors.push("NAUKRI_EMAIL is not set");
+    if (!config.naukri.password) errors.push("NAUKRI_PASSWORD is not set");
+  }
+
   if (errors.length > 0) {
     throw new Error(
       `Configuration errors:\n${errors.map((e) => `  - ${e}`).join("\n")}`
